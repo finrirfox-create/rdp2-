@@ -4,8 +4,10 @@
 
 import machine
 import rp2
+import sys
 import time
 import struct
+import uselect
 from machine import Pin, ADC, PWM
 from micropython import const
 
@@ -262,6 +264,42 @@ class GlitchHardware:
 # ============================================================================
 # BINARY PROTOCOL HANDLER
 # ============================================================================
+class UartTransport:
+    def __init__(self, uart_id: int = 0, baud: int = 921600):
+        self.uart = machine.UART(
+            uart_id,
+            baudrate=baud,
+            tx=machine.Pin(0),
+            rx=machine.Pin(1),
+            timeout=100,
+        )
+
+    def any(self) -> int:
+        return self.uart.any()
+
+    def read(self) -> bytes:
+        return self.uart.read()
+
+    def write(self, data: bytes):
+        self.uart.write(data)
+
+
+class UsbCdcTransport:
+    def __init__(self):
+        self._poller = uselect.poll()
+        self._poller.register(sys.stdin, uselect.POLLIN)
+
+    def any(self) -> int:
+        return 1 if self._poller.poll(0) else 0
+
+    def read(self) -> bytes:
+        return sys.stdin.buffer.read(64)
+
+    def write(self, data: bytes):
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+
 class BinaryProtocol:
     """Robust binary framing with CRC8."""
     
@@ -277,10 +315,11 @@ class BinaryProtocol:
     RSP_ERROR = const(0x83)
     RSP_ACK = const(0x84)
     
-    def __init__(self, uart_id: int = 0, baud: int = 921600):
-        self.uart = machine.UART(uart_id, baudrate=baud, 
-                                tx=machine.Pin(0), rx=machine.Pin(1),
-                                timeout=100)
+    def __init__(self, transport: str = "usb", uart_id: int = 0, baud: int = 921600):
+        if transport == "uart":
+            self.transport = UartTransport(uart_id=uart_id, baud=baud)
+        else:
+            self.transport = UsbCdcTransport()
         self.hw = GlitchHardware()
         self.rx_buffer = bytearray()
         
@@ -289,12 +328,12 @@ class BinaryProtocol:
         msg = bytes([cmd]) + payload
         crc = crc8(msg)
         frame = FRAME_START + bytes([len(msg)]) + msg + bytes([crc])
-        self.uart.write(frame)
+        self.transport.write(frame)
         
     def process_input(self):
         """Parse incoming UART data."""
-        if self.uart.any():
-            data = self.uart.read()
+        if self.transport.any():
+            data = self.transport.read()
             if data:
                 self.rx_buffer.extend(data)
                 self._parse_buffer()
@@ -322,8 +361,8 @@ class BinaryProtocol:
             frame = self.rx_buffer[:total_len]
             self.rx_buffer = self.rx_buffer[total_len:]
             
-            msg = frame[3:3+length+1]
-            rx_crc = frame[3+length+1]
+            msg = frame[3:3+length]
+            rx_crc = frame[3+length]
             calc_crc = crc8(msg)
             
             if rx_crc != calc_crc:

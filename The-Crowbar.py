@@ -13,6 +13,7 @@ import queue
 import csv
 import re
 import sys
+import struct
 from datetime import datetime
 from typing import Tuple, Optional, List, Dict
 import matplotlib.pyplot as plt
@@ -235,22 +236,99 @@ def decode_cfsr(cfsr: int) -> str:
 # =============================================================================
 
 class GlitcherInterface:
-    def __init__(self, port: str = "/dev/ttyACM0", baud: int = 115200):
+    FRAME_START = bytes([0xAA, 0x55])
+    CMD_STATUS = 0x01
+    CMD_ARM = 0x02
+    CMD_GLITCH = 0x03
+    CMD_STRESS = 0x04
+    CMD_RESET = 0x05
+
+    RSP_STATUS = 0x81
+    RSP_GLITCH_DONE = 0x82
+    RSP_ERROR = 0x83
+    RSP_ACK = 0x84
+
+    def __init__(self, port: str = "/dev/ttyACM0", baud: int = 115200, pulse_ns: int = 200):
         self.port = port
-        self.ser = serial.Serial(port, baud, timeout=1.0)
+        self.pulse_ns = pulse_ns
+        self.ser = serial.Serial(port, baud, timeout=0.2)
         time.sleep(0.1)
         self.ser.reset_input_buffer()
-        
-    def cmd(self, command: str, wait: float = 0.05) -> str:
-        self.ser.write((command + "\n").encode())
-        time.sleep(wait)
-        lines = []
-        while self.ser.in_waiting:
-            line = self.ser.readline().decode(errors="ignore").strip()
-            if line and not line.startswith(">"):
-                lines.append(line)
-        return " ".join(lines)
-    
+        self.rx_buffer = bytearray()
+        self.min_delay_ns = 100
+        self.max_delay_ns = 2000
+        self.current_delay_ns = self.min_delay_ns
+
+    @staticmethod
+    def _crc8(data: bytes) -> int:
+        crc = 0x00
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = ((crc << 1) ^ 0x07) & 0xFF
+                else:
+                    crc = (crc << 1) & 0xFF
+        return crc
+
+    def _send_frame(self, cmd: int, payload: bytes = b""):
+        msg = bytes([cmd]) + payload
+        crc = self._crc8(msg)
+        frame = self.FRAME_START + bytes([len(msg)]) + msg + bytes([crc])
+        self.ser.write(frame)
+
+    def _read_frame(self, timeout: float = 0.5) -> Optional[Tuple[int, bytes]]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = self.ser.read(128)
+            if data:
+                self.rx_buffer.extend(data)
+            while len(self.rx_buffer) >= 4:
+                idx = self.rx_buffer.find(self.FRAME_START)
+                if idx == -1:
+                    self.rx_buffer = bytearray()
+                    break
+                if idx > 0:
+                    self.rx_buffer = self.rx_buffer[idx:]
+                if len(self.rx_buffer) < 4:
+                    break
+                length = self.rx_buffer[2]
+                total_len = 2 + 1 + 1 + length + 1
+                if len(self.rx_buffer) < total_len:
+                    break
+                frame = self.rx_buffer[:total_len]
+                self.rx_buffer = self.rx_buffer[total_len:]
+                msg = frame[3 : 3 + length]
+                rx_crc = frame[3 + length]
+                if self._crc8(msg) != rx_crc or not msg:
+                    continue
+                cmd = msg[0]
+                payload = msg[1:]
+                return cmd, payload
+            time.sleep(0.01)
+        return None
+
+    def _arm(self, delay_ns: int, pulse_ns: int) -> bool:
+        payload = struct.pack("<HH", delay_ns, pulse_ns)
+        self._send_frame(self.CMD_ARM, payload)
+        response = self._read_frame()
+        return bool(response and response[0] == self.RSP_ACK)
+
+    def _glitch(self) -> Optional[dict]:
+        self._send_frame(self.CMD_GLITCH)
+        response = self._read_frame(timeout=1.2)
+        if not response:
+            return None
+        cmd, payload = response
+        if cmd == self.RSP_GLITCH_DONE and len(payload) >= 10:
+            _, _, pre_vcap, post_vcap, droop = struct.unpack("<HHhhh", payload[:10])
+            return {
+                "pre_vcap": pre_vcap,
+                "post_vcap": post_vcap,
+                "droop": droop,
+            }
+        return None
+
     def parse_step(self, line: str) -> Optional[Tuple[int, float, float, bool]]:
         try:
             d_match = re.search(r'd:(\d+)', line)
@@ -259,17 +337,40 @@ class GlitcherInterface:
             stress_match = re.search(r'stress:([\d.]+)', line)
             if not all([d_match, ack_match, score_match, stress_match]):
                 return None
-            return (int(d_match.group(1)), float(score_match.group(1)), 
-                    float(stress_match.group(1)), ack_match.group(1) == "ACK")
+            return (
+                int(d_match.group(1)),
+                float(score_match.group(1)),
+                float(stress_match.group(1)),
+                ack_match.group(1) == "ACK",
+            )
         except:
             return None
-    
+
     def init_optimizer(self, min_d: int = 100, max_d: int = 2000) -> str:
-        return self.cmd(f"OPTINIT {min_d} {max_d}")
-    
+        self.min_delay_ns = min_d
+        self.max_delay_ns = max_d
+        self.current_delay_ns = min_d
+        return f"OPTINIT d:{min_d}-{max_d}"
+
     def step(self) -> str:
-        return self.cmd("OPTSTEP")
-    
+        delay_ns = self.current_delay_ns
+        self.current_delay_ns += 1
+        if self.current_delay_ns > self.max_delay_ns:
+            self.current_delay_ns = self.min_delay_ns
+
+        armed = self._arm(delay_ns, self.pulse_ns)
+        if not armed:
+            return f"d:{delay_ns} score:0 stress:0 NACK"
+
+        result = self._glitch()
+        if not result:
+            return f"d:{delay_ns} score:0 stress:0 NACK"
+
+        pre_vcap = max(result["pre_vcap"], 1)
+        droop = max(result["droop"], 0)
+        score = min((droop / pre_vcap) * 100.0, 100.0)
+        return f"d:{delay_ns} score:{score:.1f} stress:0 ACK"
+
     def close(self):
         self.ser.close()
 
@@ -629,7 +730,7 @@ class GlitchExperiment:
                     cfsr = faults.get("cfsr", 0)
                     mmfar = faults.get("mmfar", 0)
                     bfar = faults.get("bfar", 0)
-                    fault_flags = decode_cfsr(csr)
+                    fault_flags = decode_cfsr(cfsr)
                 
                 # 13. Stats and display
                 self.stats[classification] += 1
