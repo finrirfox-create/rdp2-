@@ -266,26 +266,6 @@ class GlitchHardware:
 # ============================================================================
 # BINARY PROTOCOL HANDLER
 # ============================================================================
-class UartTransport:
-    def __init__(self, uart_id: int = 0, baud: int = 921600):
-        self.uart = machine.UART(
-            uart_id,
-            baudrate=baud,
-            tx=machine.Pin(0),
-            rx=machine.Pin(1),
-            timeout=100,
-        )
-
-    def any(self) -> int:
-        return self.uart.any()
-
-    def read(self) -> bytes:
-        return self.uart.read()
-
-    def write(self, data: bytes):
-        self.uart.write(data)
-
-
 class UsbCdcTransport:
     def __init__(self):
         self._poller = uselect.poll()
@@ -317,11 +297,8 @@ class BinaryProtocol:
     RSP_ERROR = const(0x83)
     RSP_ACK = const(0x84)
     
-    def __init__(self, transport: str = "usb", uart_id: int = 0, baud: int = 921600):
-        if transport == "uart":
-            self.transport = UartTransport(uart_id=uart_id, baud=baud)
-        else:
-            self.transport = UsbCdcTransport()
+    def __init__(self):
+        self.transport = UsbCdcTransport()
         self.hw = GlitchHardware()
         self.rx_buffer = bytearray()
         

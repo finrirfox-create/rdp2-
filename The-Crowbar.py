@@ -256,10 +256,10 @@ class GlitcherInterface:
     RSP_ERROR = 0x83
     RSP_ACK = 0x84
 
-    def __init__(self, port: str = "/dev/ttyACM0", baud: int = 115200, pulse_ns: int = 200):
+    def __init__(self, port: str = "/dev/ttyACM0", pulse_ns: int = 200):
         self.port = port
         self.pulse_ns = pulse_ns
-        self.ser = serial.Serial(port, baud, timeout=0.2)
+        self.ser = serial.Serial(port, timeout=0.2)
         time.sleep(0.1)
         self.ser.reset_input_buffer()
         self.rx_buffer = bytearray()
@@ -472,7 +472,6 @@ class GlitchExperiment:
     def __init__(
         self,
         glitch_port: str,
-        glitch_baud: int = 115200,
         stlink_auto: bool = True,
         log_path: Optional[str] = None,
         enable_plot: bool = True,
@@ -480,7 +479,7 @@ class GlitchExperiment:
         print_every: int = 1,
     ):
         print("[Init] Connecting to hardware...")
-        self.glitcher = GlitcherInterface(glitch_port, baud=glitch_baud)
+        self.glitcher = GlitcherInterface(glitch_port)
         self.debugger = STLinkController() if stlink_auto else None
         self.logger = DataLogger(log_path)
 
@@ -1025,7 +1024,6 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Run an experiment")
     run.add_argument("--port", default="auto", help="Glitcher serial port (or 'auto')")
     run.add_argument("--steps", type=int, default=500, help="Iterations")
-    run.add_argument("--baud", type=int, default=115200, help="Glitcher serial baud (UART only)")
     run.add_argument("--no-debug", action="store_true", help="Blind mode (no ST-Link)")
     run.add_argument("--pc-min", type=lambda x: int(x, 0), default=EXPECTED_PC_MIN)
     run.add_argument("--pc-max", type=lambda x: int(x, 0), default=EXPECTED_PC_MAX)
@@ -1076,7 +1074,6 @@ def main_cli() -> int:
 
         exp = GlitchExperiment(
             port,
-            glitch_baud=args.baud,
             stlink_auto=not args.no_debug,
             log_path=log_path,
             enable_plot=not args.no_plot,
