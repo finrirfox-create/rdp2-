@@ -13,12 +13,21 @@ import queue
 import csv
 import re
 import sys
+import struct
 from datetime import datetime
 from typing import Tuple, Optional, List, Dict
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from collections import deque
 import argparse
+import shutil
+from pathlib import Path
+
+try:
+    from serial.tools import list_ports
+    LIST_PORTS_AVAILABLE = True
+except Exception:
+    LIST_PORTS_AVAILABLE = False
 
 # Optional pandas for analysis
 try:
@@ -39,7 +48,7 @@ AUTH_PASS_ADDR = None
 
 ADAPTER_SLOW_KHZ = 100
 ADAPTER_FAST_KHZ = 1800
-PC_JUMP_THRESHOLD = 8
+PC_JUMP_THRESHOLD = 0x20
 DELAYED_SAMPLE_MS = 20
 
 # RDP Detection test matrix
@@ -235,41 +244,124 @@ def decode_cfsr(cfsr: int) -> str:
 # =============================================================================
 
 class GlitcherInterface:
-    def __init__(self, port: str = "/dev/ttyACM0", baud: int = 115200):
+    FRAME_START = bytes([0xAA, 0x55])
+    CMD_STATUS = 0x01
+    CMD_ARM = 0x02
+    CMD_GLITCH = 0x03
+    CMD_STRESS = 0x04
+    CMD_RESET = 0x05
+
+    RSP_STATUS = 0x81
+    RSP_GLITCH_DONE = 0x82
+    RSP_ERROR = 0x83
+    RSP_ACK = 0x84
+
+    def __init__(self, port: str = "/dev/ttyACM0", baud: int = 115200, pulse_ns: int = 200):
         self.port = port
-        self.ser = serial.Serial(port, baud, timeout=1.0)
+        self.pulse_ns = pulse_ns
+        self.ser = serial.Serial(port, baud, timeout=0.2)
         time.sleep(0.1)
         self.ser.reset_input_buffer()
-        
-    def cmd(self, command: str, wait: float = 0.05) -> str:
-        self.ser.write((command + "\n").encode())
-        time.sleep(wait)
-        lines = []
-        while self.ser.in_waiting:
-            line = self.ser.readline().decode(errors="ignore").strip()
-            if line and not line.startswith(">"):
-                lines.append(line)
-        return " ".join(lines)
-    
-    def parse_step(self, line: str) -> Optional[Tuple[int, float, float, bool]]:
-        try:
-            d_match = re.search(r'd:(\d+)', line)
-            ack_match = re.search(r'\b(ACK|NACK)\b', line)
-            score_match = re.search(r'score:([\d.]+)', line)
-            stress_match = re.search(r'stress:([\d.]+)', line)
-            if not all([d_match, ack_match, score_match, stress_match]):
-                return None
-            return (int(d_match.group(1)), float(score_match.group(1)), 
-                    float(stress_match.group(1)), ack_match.group(1) == "ACK")
-        except:
+        self.rx_buffer = bytearray()
+        self.min_delay_ns = 100
+        self.max_delay_ns = 2000
+        self.current_delay_ns = self.min_delay_ns
+
+    @staticmethod
+    def _crc8(data: bytes) -> int:
+        crc = 0x00
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = ((crc << 1) ^ 0x07) & 0xFF
+                else:
+                    crc = (crc << 1) & 0xFF
+        return crc
+
+    def _send_frame(self, cmd: int, payload: bytes = b""):
+        msg = bytes([cmd]) + payload
+        crc = self._crc8(msg)
+        frame = self.FRAME_START + bytes([len(msg)]) + msg + bytes([crc])
+        self.ser.write(frame)
+
+    def _read_frame(self, timeout: float = 0.5) -> Optional[Tuple[int, bytes]]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = self.ser.read(128)
+            if data:
+                self.rx_buffer.extend(data)
+            while len(self.rx_buffer) >= 4:
+                idx = self.rx_buffer.find(self.FRAME_START)
+                if idx == -1:
+                    self.rx_buffer = bytearray()
+                    break
+                if idx > 0:
+                    self.rx_buffer = self.rx_buffer[idx:]
+                if len(self.rx_buffer) < 4:
+                    break
+                length = self.rx_buffer[2]
+                total_len = 2 + 1 + 1 + length + 1
+                if len(self.rx_buffer) < total_len:
+                    break
+                frame = self.rx_buffer[:total_len]
+                self.rx_buffer = self.rx_buffer[total_len:]
+                msg = frame[3 : 3 + length]
+                rx_crc = frame[3 + length]
+                if self._crc8(msg) != rx_crc or not msg:
+                    continue
+                cmd = msg[0]
+                payload = msg[1:]
+                return cmd, payload
+            time.sleep(0.01)
+        return None
+
+    def _arm(self, delay_ns: int, pulse_ns: int) -> bool:
+        payload = struct.pack("<HH", delay_ns, pulse_ns)
+        self._send_frame(self.CMD_ARM, payload)
+        response = self._read_frame()
+        return bool(response and response[0] == self.RSP_ACK)
+
+    def _glitch(self) -> Optional[dict]:
+        self._send_frame(self.CMD_GLITCH)
+        response = self._read_frame(timeout=1.2)
+        if not response:
             return None
-    
+        cmd, payload = response
+        if cmd == self.RSP_GLITCH_DONE and len(payload) >= 10:
+            _, _, pre_vcap, post_vcap, droop = struct.unpack("<HHhhh", payload[:10])
+            return {
+                "pre_vcap": pre_vcap,
+                "post_vcap": post_vcap,
+                "droop": droop,
+            }
+        return None
+
     def init_optimizer(self, min_d: int = 100, max_d: int = 2000) -> str:
-        return self.cmd(f"OPTINIT {min_d} {max_d}")
-    
-    def step(self) -> str:
-        return self.cmd("OPTSTEP")
-    
+        self.min_delay_ns = min_d
+        self.max_delay_ns = max_d
+        self.current_delay_ns = min_d
+        return f"OPTINIT d:{min_d}-{max_d}"
+
+    def step(self) -> Optional[Tuple[int, float, float, bool]]:
+        delay_ns = self.current_delay_ns
+        self.current_delay_ns += 1
+        if self.current_delay_ns > self.max_delay_ns:
+            self.current_delay_ns = self.min_delay_ns
+
+        armed = self._arm(delay_ns, self.pulse_ns)
+        if not armed:
+            return None
+
+        result = self._glitch()
+        if not result:
+            return None
+
+        pre_vcap = max(result["pre_vcap"], 1)
+        droop = max(result["droop"], 0)
+        score = min((droop / pre_vcap) * 100.0, 100.0)
+        return delay_ns, score, 0.0, True
+
     def close(self):
         self.ser.close()
 
@@ -377,14 +469,30 @@ class LivePlotter(threading.Thread):
 # =============================================================================
 
 class GlitchExperiment:
-    def __init__(self, glitch_port: str, stlink_auto: bool = True):
+    def __init__(
+        self,
+        glitch_port: str,
+        glitch_baud: int = 115200,
+        stlink_auto: bool = True,
+        log_path: Optional[str] = None,
+        enable_plot: bool = True,
+        quiet: bool = False,
+        print_every: int = 1,
+    ):
         print("[Init] Connecting to hardware...")
-        self.glitcher = GlitcherInterface(glitch_port)
+        self.glitcher = GlitcherInterface(glitch_port, baud=glitch_baud)
         self.debugger = STLinkController() if stlink_auto else None
-        self.logger = DataLogger()
-        self.plot_q = queue.Queue()
-        self.plotter = LivePlotter(self.plot_q)
-        self.plotter.start()
+        self.logger = DataLogger(log_path)
+
+        # UX controls (do not affect experiment logic)
+        self.quiet = quiet
+        self.print_every = max(1, int(print_every))
+
+        # Plotting is optional for headless/CI use
+        self.plot_q = queue.Queue() if enable_plot else None
+        self.plotter = LivePlotter(self.plot_q) if enable_plot else None
+        if self.plotter:
+            self.plotter.start()
         
         self.step_count = 0
         self.consecutive_unknowns = 0
@@ -452,6 +560,17 @@ class GlitchExperiment:
             return "flash_readable_when_locked"
         
         return None
+
+    @staticmethod
+    def _is_vector_suspicious(vector_value: int) -> bool:
+        """Return True if vector looks corrupted (non-flash or non-Thumb aligned)."""
+        if not vector_value:
+            return True
+        if not (EXPECTED_PC_MIN <= vector_value <= EXPECTED_PC_MAX):
+            return True
+        if vector_value & 0x1 == 0:
+            return True
+        return False
     
     def verify_persistent_bypass(self) -> bool:
         """
@@ -479,13 +598,28 @@ class GlitchExperiment:
             return True
         
         return False
+
+    def verify_vector_persistence(self) -> bool:
+        """Check if vector remains suspicious after a reset."""
+        if not self.debugger:
+            return False
+        self.debugger.reset_target(run=True)
+        time.sleep(0.05)
+        post_reset_vector = self.debugger._read_vector(1)
+        if post_reset_vector and self._is_vector_suspicious(post_reset_vector):
+            print(f"[Persistent] Vector remains suspicious: 0x{post_reset_vector:08x}")
+            return True
+        return False
     
     def run(self, steps: int = 500, delay_between: float = 0.05):
-        print(self.glitcher.init_optimizer())
-        print(f"\n[Config] PC Window: 0x{EXPECTED_PC_MIN:08x}-0x{EXPECTED_PC_MAX:08x}")
-        print(f"[Safety] Max lockups before abort: {self.max_lockups}")
-        print("Step  | Delay(ns) | Score  | Classification      | Result                | Persist | Success")
-        print("-" * 95)
+        # Always init optimizer; optionally suppress banner output
+        opt_banner = self.glitcher.init_optimizer()
+        if not self.quiet:
+            print(opt_banner)
+            print(f"\n[Config] PC Window: 0x{EXPECTED_PC_MIN:08x}-0x{EXPECTED_PC_MAX:08x}")
+            print(f"[Safety] Max lockups before abort: {self.max_lockups}")
+            print("Step  | Delay(ns) | Score  | Classification      | Result                | Persist | Success")
+            print("-" * 95)
         
         try:
             for i in range(steps):
@@ -514,9 +648,8 @@ class GlitchExperiment:
                 
                 # 3. Trigger glitch with precise timing
                 start_time = time.perf_counter()
-                line = self.glitcher.step()
-                parsed = self.glitcher.parse_step(line)
-                
+                parsed = self.glitcher.step()
+
                 if not parsed:
                     self.debugger.set_adapter_speed(ADAPTER_FAST_KHZ)
                     print(f"{i:04d} | PARSE_ERROR")
@@ -557,8 +690,11 @@ class GlitchExperiment:
                 # 6. Vector corruption check
                 post_vector = self.debugger._read_vector(1)
                 if baseline_vector and post_vector and baseline_vector != post_vector:
-                    vector_corrupt = True
-                    semantic_result = "vector_table_corrupted"
+                    if self._is_vector_suspicious(post_vector):
+                        vector_corrupt = True
+                        semantic_result = "vector_table_corrupted"
+                        if self.verify_vector_persistence():
+                            persistent = True
                 
                 # 7. PC discontinuity
                 pc_jump = False
@@ -629,7 +765,7 @@ class GlitchExperiment:
                     cfsr = faults.get("cfsr", 0)
                     mmfar = faults.get("mmfar", 0)
                     bfar = faults.get("bfar", 0)
-                    fault_flags = decode_cfsr(csr)
+                    fault_flags = decode_cfsr(cfsr)
                 
                 # 13. Stats and display
                 self.stats[classification] += 1
@@ -639,8 +775,12 @@ class GlitchExperiment:
                 pc_str = f"0x{pc:08x}" if pc else "????????"
                 sem_str = semantic_result or "-"
                 persist_str = "YES" if persistent else ("-" if not semantic_result else "no")
-                print(f"{i:04d} | {delay:9d} | {score:6.1f} | {classification:19s} | "
-                      f"{sem_str:21s} | {persist_str:7s} | {'✓' if success else ' '}")
+
+                # Respect --quiet and --print-every (but always show notable events)
+                notable = success or persistent or classification in ("semantic_bypass", "auth_skip", "vector_corruption")
+                if (not self.quiet) and (notable or (i % self.print_every == 0)):
+                    print(f"{i:04d} | {delay:9d} | {score:6.1f} | {classification:19s} | "
+                          f"{sem_str:21s} | {persist_str:7s} | {'✓' if success else ' '}")
                 
                 # 14. Log
                 self.logger.log([
@@ -651,7 +791,8 @@ class GlitchExperiment:
                 ])
                 
                 # 15. Plot
-                self.plot_q.put((delay, score, classification, success))
+                if self.plot_q:
+                    self.plot_q.put((delay, score, classification, success))
                 
         except KeyboardInterrupt:
             print("\n[Run] Interrupted by user")
@@ -664,8 +805,7 @@ class GlitchExperiment:
     
     def _run_blind(self, i, delay_between):
         """Blind mode without debugger."""
-        line = self.glitcher.step()
-        parsed = self.glitcher.parse_step(line)
+        parsed = self.glitcher.step()
         if not parsed:
             print(f"{i:04d} | PARSE_ERROR")
             return
@@ -675,7 +815,8 @@ class GlitchExperiment:
         success = False
         self.logger.log([time.time(), i, delay, score, stress, int(ack), 
                         "blind", "", classification, "", 0, 0, "N/A", "", "", int(success)])
-        self.plot_q.put((delay, score, classification, success))
+        if self.plot_q:
+            self.plot_q.put((delay, score, classification, success))
     
     def _print_summary(self):
         print("\n" + "="*70)
@@ -791,30 +932,168 @@ def analyze_csv_file(csv_file: str):
 
 
 # =============================================================================
+# UX Helpers (CLI convenience)
+# =============================================================================
+
+def _list_ports_text() -> str:
+    if not LIST_PORTS_AVAILABLE:
+        return "pyserial list_ports not available"
+    ports = list(list_ports.comports())
+    if not ports:
+        return "(no serial ports found)"
+    lines = []
+    for p in ports:
+        desc = p.description or ""
+        hwid = p.hwid or ""
+        lines.append(f"{p.device:>15}  {desc}  {hwid}".rstrip())
+    return "\n".join(lines)
+
+
+def resolve_port(port_arg: str) -> str:
+    """Resolve a user port argument, supporting '--port auto'."""
+    if port_arg and port_arg.lower() != "auto":
+        return port_arg
+    if not LIST_PORTS_AVAILABLE:
+        raise SystemExit("Port auto-detect requires pyserial 'list_ports'. Install pyserial or pass --port explicitly.")
+    ports = list(list_ports.comports())
+    if not ports:
+        raise SystemExit("No serial ports found. Use --list-ports and pass --port explicitly.")
+    # Prefer common USB CDC / ACM devices
+    preferred = []
+    for p in ports:
+        dev = (p.device or "")
+        if "ACM" in dev or "USB" in dev:
+            preferred.append(p)
+    return (preferred[0] if preferred else ports[0]).device
+
+
+def make_output_path(out: Optional[str], out_dir: Optional[str], tag: Optional[str]) -> Optional[str]:
+    """Compute CSV output path. If 'out' is provided, it wins."""
+    if out:
+        return out
+    if not out_dir and not tag:
+        return None  # fall back to DataLogger auto timestamp
+    out_dir = out_dir or "."
+    safe_tag = ""
+    if tag:
+        safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", tag).strip("_")
+        safe_tag = f"_{safe_tag}" if safe_tag else ""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    return str(Path(out_dir) / f"crowbar{safe_tag}_{ts}.csv")
+
+
+def doctor_cmd(port: str) -> int:
+    """Basic environment checks for ease-of-use."""
+    ok = True
+    print("Crowbar doctor checks")
+    print("-" * 60)
+
+    if shutil.which("openocd") is None:
+        print("✗ openocd not found on PATH")
+        ok = False
+    else:
+        print("✓ openocd found")
+
+    if LIST_PORTS_AVAILABLE:
+        print("\nSerial ports:")
+        print(_list_ports_text())
+    else:
+        print("\n• serial port listing unavailable (missing pyserial list_ports)")
+
+    # Attempt to open the requested port
+    try:
+        resolved = resolve_port(port)
+        s = serial.Serial(resolved, 115200, timeout=0.5)
+        s.close()
+        print(f"\n✓ serial open OK: {resolved}")
+    except Exception as e:
+        print(f"\n✗ serial open failed ({port}): {e}")
+        print("  Tip: on Linux you may need to add your user to the 'dialout' group.")
+        ok = False
+
+    print("-" * 60)
+    return 0 if ok else 2
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Crowbar - STM32F2 semantic bypass detection")
+    p.add_argument("--list-ports", action="store_true", help="List serial ports and exit")
+
+    sub = p.add_subparsers(dest="cmd")
+
+    run = sub.add_parser("run", help="Run an experiment")
+    run.add_argument("--port", default="auto", help="Glitcher serial port (or 'auto')")
+    run.add_argument("--steps", type=int, default=500, help="Iterations")
+    run.add_argument("--baud", type=int, default=115200, help="Glitcher serial baud (UART only)")
+    run.add_argument("--no-debug", action="store_true", help="Blind mode (no ST-Link)")
+    run.add_argument("--pc-min", type=lambda x: int(x, 0), default=EXPECTED_PC_MIN)
+    run.add_argument("--pc-max", type=lambda x: int(x, 0), default=EXPECTED_PC_MAX)
+    run.add_argument("--max-lockups", type=int, default=5, help="Abort threshold")
+    run.add_argument("--out", default=None, help="CSV output path (overrides --out-dir/--tag)")
+    run.add_argument("--out-dir", default=None, help="Output directory for auto-named CSVs")
+    run.add_argument("--tag", default=None, help="Tag appended to auto-named CSVs")
+    run.add_argument("--no-plot", action="store_true", help="Disable live plotting (headless)")
+    run.add_argument("--quiet", action="store_true", help="Suppress per-step output (still logs)")
+    run.add_argument("--print-every", type=int, default=1, help="Print every N steps (ignored with --quiet)")
+
+    ana = sub.add_parser("analyze", help="Analyze an existing CSV file")
+    ana.add_argument("csv", help="Path to CSV log")
+
+    doc = sub.add_parser("doctor", help="Check environment, ports, and toolchain")
+    doc.add_argument("--port", default="auto", help="Glitcher serial port (or 'auto')")
+
+    return p
+
+
+def main_cli() -> int:
+    global EXPECTED_PC_MIN, EXPECTED_PC_MAX
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if getattr(args, "list_ports", False):
+        print(_list_ports_text())
+        return 0
+
+    if not args.cmd:
+        parser.print_help()
+        return 2
+
+    if args.cmd == "doctor":
+        return doctor_cmd(args.port)
+
+    if args.cmd == "analyze":
+        analyze_csv_file(args.csv)
+        return 0
+
+    if args.cmd == "run":
+        EXPECTED_PC_MIN = args.pc_min
+        EXPECTED_PC_MAX = args.pc_max
+
+        port = resolve_port(args.port)
+        log_path = make_output_path(args.out, args.out_dir, args.tag)
+
+        exp = GlitchExperiment(
+            port,
+            glitch_baud=args.baud,
+            stlink_auto=not args.no_debug,
+            log_path=log_path,
+            enable_plot=not args.no_plot,
+            quiet=args.quiet,
+            print_every=args.print_every,
+        )
+        exp.max_lockups = args.max_lockups
+        exp.run(steps=args.steps)
+        return 0
+
+    parser.print_help()
+    return 2
+
+
+# =============================================================================
 # Entry Point
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="STM32F2 Security Bypass Detection v4.1")
-    parser.add_argument("--port", default="/dev/ttyACM0", help="Pico serial port")
-    parser.add_argument("--steps", type=int, default=500, help="Iterations")
-    parser.add_argument("--no-debug", action="store_true", help="Blind mode (no ST-Link)")
-    parser.add_argument("--pc-min", type=lambda x: int(x, 0), default=EXPECTED_PC_MIN)
-    parser.add_argument("--pc-max", type=lambda x: int(x, 0), default=EXPECTED_PC_MAX)
-    parser.add_argument("--max-lockups", type=int, default=5, help="Abort threshold")
-    parser.add_argument("--analyze", type=str, help="Analyze existing CSV file")
-    
-    args = parser.parse_args()
-    
-    # Analysis mode only
-    if args.analyze:
-        analyze_csv_file(args.analyze)
-        sys.exit(0)
-    
-    # Run mode
-    EXPECTED_PC_MIN = args.pc_min
-    EXPECTED_PC_MAX = args.pc_max
-    
-    exp = GlitchExperiment(args.port, stlink_auto=not args.no_debug)
-    exp.max_lockups = args.max_lockups
-    exp.run(steps=args.steps)
+    raise SystemExit(main_cli())
