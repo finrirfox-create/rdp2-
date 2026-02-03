@@ -35,6 +35,7 @@ NS_PER_CYCLE = const(20.83)
 MAX_GLITCH_NS = const(10000)   # 10us max delay
 MAX_PULSE_NS = const(500)      # 500ns max pulse width (safety)
 WATCHDOG_MS = const(8000)      # 8 second watchdog
+POST_GLITCH_DELAY_MS = const(1)  # Delay before post-glitch ADC sampling
 
 # Voltage divider (adjust for your hardware)
 DIVIDER_MULT = 11.0
@@ -239,11 +240,12 @@ class GlitchHardware:
             time.sleep_us(100)
         
         if not completed:
+            self.sm.restart()
             self.armed = False
             return {'error': 'Timeout waiting for trigger/completion'}
         
         # Post-glitch measurement
-        time.sleep_ms(1)  # Let VCAP settle
+        time.sleep_ms(POST_GLITCH_DELAY_MS)  # Let VCAP settle
         post_vcap, post_min, post_max = self.read_vcap(4)
         droop = pre_vcap - post_vcap
         

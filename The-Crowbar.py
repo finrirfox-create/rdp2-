@@ -48,7 +48,7 @@ AUTH_PASS_ADDR = None
 
 ADAPTER_SLOW_KHZ = 100
 ADAPTER_FAST_KHZ = 1800
-PC_JUMP_THRESHOLD = 8
+PC_JUMP_THRESHOLD = 0x20
 DELAYED_SAMPLE_MS = 20
 
 # RDP Detection test matrix
@@ -576,6 +576,17 @@ class GlitchExperiment:
             return "flash_readable_when_locked"
         
         return None
+
+    @staticmethod
+    def _is_vector_suspicious(vector_value: int) -> bool:
+        """Return True if vector looks corrupted (non-flash or non-Thumb aligned)."""
+        if not vector_value:
+            return True
+        if not (EXPECTED_PC_MIN <= vector_value <= EXPECTED_PC_MAX):
+            return True
+        if vector_value & 0x1 == 0:
+            return True
+        return False
     
     def verify_persistent_bypass(self) -> bool:
         """
@@ -684,8 +695,9 @@ class GlitchExperiment:
                 # 6. Vector corruption check
                 post_vector = self.debugger._read_vector(1)
                 if baseline_vector and post_vector and baseline_vector != post_vector:
-                    vector_corrupt = True
-                    semantic_result = "vector_table_corrupted"
+                    if self._is_vector_suspicious(post_vector):
+                        vector_corrupt = True
+                        semantic_result = "vector_table_corrupted"
                 
                 # 7. PC discontinuity
                 pc_jump = False
