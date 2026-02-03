@@ -256,10 +256,10 @@ class GlitcherInterface:
     RSP_ERROR = 0x83
     RSP_ACK = 0x84
 
-    def __init__(self, port: str = "/dev/ttyACM0", pulse_ns: int = 200):
+    def __init__(self, port: str = "/dev/ttyACM0", baud: int = 115200, pulse_ns: int = 200):
         self.port = port
         self.pulse_ns = pulse_ns
-        self.ser = serial.Serial(port, timeout=0.2)
+        self.ser = serial.Serial(port, baud, timeout=0.2)
         time.sleep(0.1)
         self.ser.reset_input_buffer()
         self.rx_buffer = bytearray()
@@ -360,7 +360,8 @@ class GlitcherInterface:
         pre_vcap = max(result["pre_vcap"], 1)
         droop = max(result["droop"], 0)
         score = min((droop / pre_vcap) * 100.0, 100.0)
-        return delay_ns, score, 0.0, True
+        # stress is currently not driven by this host implementation
+        return (delay_ns, score, 0.0, True)
 
     def close(self):
         self.ser.close()
