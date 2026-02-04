@@ -1,4 +1,4 @@
-# fault_injection.py - Deterministic PIO Glitcher v9.1 (Fixed)
+# fault_injection.py - Deterministic PIO Glitcher v9.2 (USB-Only)
 # Features: PIO timing, binary protocol, watchdog, hardware trigger sync
 # Target: STM32F205 via VCAP glitching
 
@@ -99,6 +99,25 @@ def crc8(data: bytes) -> int:
             else:
                 crc = (crc << 1) & 0xFF
     return crc
+
+# ============================================================================
+# USB CDC TRANSPORT
+# ============================================================================
+class UsbCdcTransport:
+    """USB CDC (Serial over USB) transport for direct PC connection."""
+    def __init__(self):
+        self._poller = uselect.poll()
+        self._poller.register(sys.stdin, uselect.POLLIN)
+
+    def any(self) -> int:
+        return 1 if self._poller.poll(0) else 0
+
+    def read(self) -> bytes:
+        return sys.stdin.buffer.read(64)
+
+    def write(self, data: bytes):
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
 
 # ============================================================================
 # HARDWARE ABSTRACTION
@@ -266,24 +285,8 @@ class GlitchHardware:
 # ============================================================================
 # BINARY PROTOCOL HANDLER
 # ============================================================================
-class UsbCdcTransport:
-    def __init__(self):
-        self._poller = uselect.poll()
-        self._poller.register(sys.stdin, uselect.POLLIN)
-
-    def any(self) -> int:
-        return 1 if self._poller.poll(0) else 0
-
-    def read(self) -> bytes:
-        return sys.stdin.buffer.read(64)
-
-    def write(self, data: bytes):
-        sys.stdout.buffer.write(data)
-        sys.stdout.buffer.flush()
-
-
 class BinaryProtocol:
-    """Robust binary framing with CRC8."""
+    """Robust binary framing with CRC8 over USB CDC."""
     
     CMD_STATUS = const(0x01)
     CMD_ARM = const(0x02)
@@ -310,7 +313,7 @@ class BinaryProtocol:
         self.transport.write(frame)
         
     def process_input(self):
-        """Parse incoming UART data."""
+        """Parse incoming USB data."""
         if self.transport.any():
             data = self.transport.read()
             if data:
@@ -417,7 +420,7 @@ class BinaryProtocol:
 # MAIN LOOP
 # ============================================================================
 def main():
-    print("RP2040 Glitcher v9.1 - Binary Protocol (PIO)")
+    print("RP2040 Glitcher v9.2 - Binary Protocol (USB-Only)")
     print("PIO Freq: {}MHz".format(PIO_FREQ//1000000))
     
     proto = BinaryProtocol()
